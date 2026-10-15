@@ -324,6 +324,63 @@ class PickerTests(unittest.TestCase):
         self.assertFalse(notice.is_visible())
         self.assert_modal_open()
 
+    def add_app_bundle(self, body):
+        """Serves a stand-in for YouTube's main bundle and links it, unexecuted, from the page."""
+        fetches = []
+        def serve(route):
+            fetches.append(route.request.url)
+            route.fulfill(content_type='text/javascript', body=body)
+        self.page.route('**/ytmainappweb/**', serve)
+        self.page.evaluate("""() => {
+            const script = document.createElement('script');
+            script.type = 'text/plain';
+            script.src = '/s/_/ytmainappweb/_/js/k=ytmainappweb.kevlar_base.test/m=kevlar_base_module';
+            document.head.append(script);
+        }""")
+        return fetches
+
+    def test_a_bundle_without_tenor_ids_changes_nothing_and_is_read_once_per_release(self):
+        fetches = self.add_app_bundle('var comment = { commentText: 1 };')
+        self.page.evaluate('chrome.storage.local.set({ blockedAt: Date.now() })')
+        self.open_picker()
+        self.page.wait_for_function('window.storedItems.officialGifs !== undefined')
+        self.assertFalse(self.page.evaluate('storedItems.officialGifs.found'))
+        self.assertIsInstance(self.page.evaluate('storedItems.blockedAt'), int)
+        self.assertFalse(self.page.locator('.official').is_visible())
+        self.assertTrue(self.page.locator('.blocked').is_visible())
+        self.page.keyboard.press('Escape')
+
+        stored = self.page.evaluate('storedItems')
+        self.open_fixture()
+        self.page.evaluate('items => Object.assign(window.storedItems, items)', stored)
+        self.add_app_bundle('var comment = { commentText: 1 };')
+        self.open_picker()
+        self.page.evaluate('() => new Promise((resolve) => setTimeout(resolve, 300))')
+        self.assertEqual(len(fetches), 1)
+
+    def test_a_bundle_that_sends_tenor_ids_brings_retries_back_and_shows_a_notice_that_can_be_hidden(self):
+        self.add_app_bundle('var comment = { commentText: 1, tenorId: 2 };')
+        self.page.evaluate('chrome.storage.local.set({ blockedAt: Date.now() })')
+        official = self.page.locator('.official')
+        self.open_picker()
+        official.wait_for(state='visible')
+        self.assertIn('posting may work again', official.inner_text())
+        self.assertTrue(self.page.evaluate('storedItems.officialGifs.found'))
+        self.assertIsNone(self.page.evaluate('storedItems.blockedAt ?? null'))
+        self.assertFalse(self.page.locator('.blocked').is_visible())
+        official.get_by_role('button', name='Hide this notice').click()
+        self.assertFalse(official.is_visible())
+        self.assertTrue(self.page.evaluate('storedItems.officialGifs.dismissed'))
+        self.page.keyboard.press('Escape')
+        self.open_picker()
+        self.assertFalse(official.is_visible())
+
+        self.page.locator('.tile').first.click()
+        self.page.locator('#modal-box #submit-button button').click()
+        self.page.locator('#modal-box .gcfy-attachment').wait_for(state='detached')
+        self.assertEqual(self.page.evaluate('stats.arms[0].retry'), True)
+        self.assert_modal_open()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

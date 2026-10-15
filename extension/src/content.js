@@ -34,6 +34,12 @@
   // try each and the picker says so, for this long or until a GIF goes through.
   const BLOCKED_MEMORY_MS = 24 * 60 * 60 * 1000;
   const BLOCKED_ISSUE = 'https://github.com/rayytor/desktop_gifs/issues/93';
+  // YouTube's own desktop code has never sent a Tenor ID: on 15 October 2026
+  // its main bundle did not contain the word "tenor" at all, and GIF comments
+  // only worked because main.js added the ID. A release whose bundle mentions
+  // tenorId has most likely started GIF comments on desktop itself.
+  const APP_BUNDLE = 'script[src*="/ytmainappweb/"], script[src*="/desktop_polymer"]';
+  const OFFICIAL_FIELD = 'tenorId';
 
   const PICKER_CSS = `
     :host { all: initial; position: fixed; z-index: 2147483647; }
@@ -83,6 +89,18 @@
     .blocked a { color: var(--accent); text-decoration: none; }
     .blocked a:hover { text-decoration: underline; }
     .blocked a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .official {
+      flex: none; display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px;
+      border-bottom: 1px solid var(--line); color: var(--accent);
+    }
+    .official[hidden] { display: none; }
+    .official span { flex: 1; min-width: 0; }
+    .official button {
+      flex: none; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 50%;
+      background: transparent; color: var(--muted); font: 16px/1 Arial, sans-serif; cursor: pointer;
+    }
+    .official button:hover { background: var(--field); }
+    .official button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .status { flex: none; padding: 6px 12px 0; color: var(--muted); }
     .status:empty { display: none; }
     .status[data-kind="error"] { color: var(--err); }
@@ -185,7 +203,7 @@
 
   // ------------------------------------------------------------------ picker
 
-  const picker = { open: false, host: null, anchor: null, box: null, els: null, seq: 0, timer: 0, gifs: [], nonce: null, favorites: [], showingFavorites: false, updateAsked: false, blockedAt: 0 };
+  const picker = { open: false, host: null, anchor: null, box: null, els: null, seq: 0, timer: 0, gifs: [], nonce: null, favorites: [], showingFavorites: false, updateAsked: false, blockedAt: 0, officialAsked: false, official: null };
 
   function buildPicker() {
     const host = document.createElement('div');
@@ -253,6 +271,18 @@
     blockedLink.textContent = '#93';
     blocked.append('YouTube refused your last GIF comment from desktop, so posting will likely fail. Each GIF now gets one try. See ', blockedLink, '.');
 
+    const official = document.createElement('div');
+    official.className = 'official';
+    official.hidden = true;
+    const officialText = document.createElement('span');
+    officialText.textContent = "YouTube's desktop site now has its own code for GIF comments, so posting may work again.";
+    const officialClose = document.createElement('button');
+    officialClose.type = 'button';
+    officialClose.textContent = '×';
+    officialClose.title = 'Hide this notice';
+    officialClose.setAttribute('aria-label', 'Hide this notice');
+    official.append(officialText, officialClose);
+
     const status = document.createElement('div');
     status.className = 'status';
     status.setAttribute('role', 'status');
@@ -260,7 +290,7 @@
     const grid = document.createElement('div');
     grid.className = 'grid';
 
-    panel.append(search, update, blocked, status, grid);
+    panel.append(search, update, official, blocked, status, grid);
     root.append(style, panel);
 
     input.addEventListener('input', () => {
@@ -288,8 +318,14 @@
       input.focus();
     });
 
+    officialClose.addEventListener('click', () => {
+      official.hidden = true;
+      if (picker.official) chrome.storage.local.set({ officialGifs: { ...picker.official, dismissed: true } }).catch(() => {});
+      input.focus();
+    });
+
     picker.host = host;
-    picker.els = { panel, input, status, grid, favTab, update, updateText, updateLink, blocked };
+    picker.els = { panel, input, status, grid, favTab, update, updateText, updateLink, blocked, official };
   }
 
   // A ZIP-installed extension does not update itself, so the picker says when
@@ -312,6 +348,37 @@
     updateText.textContent = `Desktop GIFs ${release.version} is out.`;
     updateLink.href = release.url;
     update.hidden = false;
+  }
+
+  // Looks for OFFICIAL_FIELD in YouTube's own code, once per YouTube release:
+  // the bundle's URL changes with every release, and the browser usually has
+  // the file cached already. Asked when the picker first opens on a page.
+  async function checkOfficial() {
+    if (picker.officialAsked) return;
+    picker.officialAsked = true;
+    const urls = [...new Set([...document.querySelectorAll(APP_BUNDLE)].map((s) => s.src))].sort();
+    if (!urls.length) return;
+    const release = urls.join(' ');
+    try {
+      const { officialGifs: before } = await chrome.storage.local.get('officialGifs');
+      if (before && before.release === release) return;
+      const texts = await Promise.all(urls.map(async (url) => {
+        const response = await fetch(url, { cache: 'force-cache' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.text();
+      }));
+      const found = texts.some((text) => text.includes(OFFICIAL_FIELD));
+      // A closed notice stays closed for later releases that still have it.
+      const dismissed = found && !!(before && before.found && before.dismissed);
+      await chrome.storage.local.set({ officialGifs: { release, found, dismissed } });
+      // The block is likely over, so GIFs get their retries back.
+      if (found) await chrome.storage.local.remove('blockedAt');
+    } catch (e) { /* checked again on the next page */ }
+  }
+
+  function useOfficial(stored) {
+    picker.official = stored && typeof stored === 'object' ? stored : null;
+    if (picker.els) picker.els.official.hidden = !(picker.official && picker.official.found && !picker.official.dismissed);
   }
 
   const recentlyBlocked = () => Date.now() - picker.blockedAt < BLOCKED_MEMORY_MS;
@@ -351,6 +418,8 @@
     picker.host.showPopover();
     place();
     showBlocked();
+    useOfficial(picker.official);
+    checkOfficial();
     picker.els.input.focus();
     load(picker.els.input.value);
     showUpdate();
@@ -470,9 +539,11 @@
 
   chrome.storage.local.get('favorites').then((items) => useFavorites(items.favorites));
   chrome.storage.local.get('blockedAt').then((items) => useBlocked(items.blockedAt)).catch(() => {});
+  chrome.storage.local.get('officialGifs').then((items) => useOfficial(items.officialGifs)).catch(() => {});
   const onStorage = (changes, area) => {
     if (area === 'local' && changes.favorites) useFavorites(changes.favorites.newValue);
     if (area === 'local' && changes.blockedAt) useBlocked(changes.blockedAt.newValue);
+    if (area === 'local' && changes.officialGifs) useOfficial(changes.officialGifs.newValue);
   };
   chrome.storage.onChanged.addListener(onStorage);
 
